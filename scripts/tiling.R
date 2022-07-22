@@ -5,13 +5,16 @@ str_glue("~/bucket_mine/remo/monthly/{dom}-22/") %>%
   list.dirs(recursive = F) %>% 
   .[1] %>% 
   list.files(full.names = T) %>% 
+  .[str_detect(., "regrid")] %>% 
+  .[str_detect(., "cut", negate = T)] %>%
+  .[str_detect(., "REMO")] %>% 
   .[1] -> f
 
 f %>% 
   read_ncdf(ncsub = cbind(start = c(1, 1, 1),
                           count = c(NA,NA,1))) %>% 
   suppressMessages() %>% 
-  adrop() -> s_proxy
+  slice(time, 1) -> s_proxy
 
 # lon *****
 s_proxy %>% 
@@ -40,39 +43,81 @@ split(d_lat,
 
 # ******
 
-imap_dfr(lon_chunks, function(lon_ch, lon_i){
-  imap_dfr(lat_chunks, function(lat_ch, lat_i){
+# imap_dfr(lon_chunks, function(lon_ch, lon_i){
+#   imap_dfr(lat_chunks, function(lat_ch, lat_i){
+#     
+#     # lon_ch <- lon_chunks[[7]]
+#     # lat_ch <- lat_chunks[[6]]
+#     
+#     s_proxy %>% 
+#       slice(lon, lon_ch[1]:lon_ch[2]) %>% 
+#       slice(lat, lat_ch[1]:lat_ch[2]) -> s_proxy_sub
+#     
+#     st_warp(land_rast %>%
+#               st_set_dimensions(which = c(1,2),
+#                                 names = c("lon", "lat")),
+#             s_proxy_sub) -> land_rast_sub
+#     
+#     c(s_proxy_sub, land_rast_sub) %>% 
+#       as_tibble() %>%
+#       rename(var = 3) %>% 
+#       filter(!is.na(var)) %>% # remove empty cells of domain
+#       summarize(prop = sum(!is.na(a))/n()) %>% # how much is land?
+#       pull(prop) -> prop
+#     
+#     tibble(
+#       cover = ifelse(is.na(prop) | prop < 0.005, F, T),
+#       lon_ch = lon_i,
+#       lat_ch = lat_i
+#     )
+#     
+#   })
+# }) %>%
+#   filter(cover == TRUE) %>% 
+#   mutate(r = row_number()) -> chunks_ind
+
+# ******
+
+# table + polygons
+
+imap(lon_chunks, function(lon_ch, lon_i){
+  imap(lat_chunks, function(lat_ch, lat_i){
     
-    # lon_ch <- lon_chunks[[7]]
-    # lat_ch <- lat_chunks[[6]]
-    
-    s_proxy %>% 
-      slice(lon, lon_ch[1]:lon_ch[2]) %>% 
+    s_proxy %>%
+      slice(lon, lon_ch[1]:lon_ch[2]) %>%
       slice(lat, lat_ch[1]:lat_ch[2]) -> s_proxy_sub
-    
+
     st_warp(land_rast %>%
               st_set_dimensions(which = c(1,2),
                                 names = c("lon", "lat")),
             s_proxy_sub) -> land_rast_sub
-    
-    c(s_proxy_sub, land_rast_sub) %>% 
+
+    land_rast_sub %>%
+      st_as_sf(merge = T) %>%
+      mutate(lon_ch = lon_i,
+             lat_ch = lat_i) -> pol
+
+    c(s_proxy_sub, land_rast_sub) %>%
       as_tibble() %>%
-      rename(var = 3) %>% 
+      rename(var = 3) %>%
       filter(!is.na(var)) %>% # remove empty cells of domain
       summarize(prop = sum(!is.na(a))/n()) %>% # how much is land?
       pull(prop) -> prop
-    
-    tibble(
-      cover = ifelse(is.na(prop) | prop < 0.001, F, T),
-      lon_ch = lon_i,
-      lat_ch = lat_i
-    )
-    
-  })
+
+    pol %>%
+      mutate(cover = ifelse(is.na(prop) | prop < 0.005, F, T))
+
+  }) %>%
+    bind_rows()
+
 }) %>%
-  filter(cover == TRUE) %>% 
+  bind_rows() %>%
+  filter(cover == T) %>%
+  group_by(lon_ch, lat_ch) %>%
+  summarize() %>%
+  ungroup() %>%
   mutate(r = row_number()) -> chunks_ind
 
-# ******
 
-rm(f, s_proxy, d_lon, n_lon, d_lat, n_lat, sz)
+rm(f, #s_proxy, 
+   d_lon, n_lon, d_lat, n_lat, sz)

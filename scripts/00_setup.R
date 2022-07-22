@@ -22,13 +22,13 @@ options(future.globals.maxSize= 10000*1024^2)
 # MOUNT BUCKETS AND DRIVE
 
 # risk team bucket
-dir_bucket_risk <- "~/bucket_risk/"
+# dir_bucket_risk <- "~/bucket_risk/"
 
 # my bucket
-dir_bucket_mine <- "~/bucket_mine/"
+# dir_bucket_mine <- "~/bucket_mine/"
 
 # persistent disk
-dir_disk <- "~/pers_disk"
+# dir_disk <- "~/pers_disk"
 
 # *************************************************************************************************
 

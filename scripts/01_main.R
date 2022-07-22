@@ -1,12 +1,17 @@
+
 # source("~/00-mount.R")
 
 source("scripts/00_setup.R")
-source("scripts/penman_mine.R")
+source("scripts/penman_mine_remo.R")
 source("scripts/write_nc.R")
 
-plan(multicore, workers = availableCores() - 1)
+library(lmomco)
+list.files("scripts/functions_spei/", full.names = T) %>% 
+  walk(source)
 
-# Land raster to evaluate whether chunk should be calculated
+plan(multisession)
+
+# Land raster to evaluate whether chunk should be calculated or skipped
 st_read("~/bucket_mine/misc_data/ne_50m_land/ne_50m_land.shp") %>%
   mutate(a = 1) %>%
   select(a) %>%
@@ -14,7 +19,7 @@ st_read("~/bucket_mine/misc_data/ne_50m_land/ne_50m_land.shp") %>%
 
 
 # DOMAIN LOOP
-dom <- c("AFR", "AUS", "CAM", "CAS", "EAS", "EUR", "NAM", "SAM", "SEA", "WAS")[6]
+dom <- c("AFR", "AUS", "CAM", "CAS", "EAS", "EUR", "NAM", "SAM", "SEA", "WAS")[7]
 
 
 # ********************************************
@@ -24,17 +29,23 @@ dom <- c("AFR", "AUS", "CAM", "CAS", "EAS", "EUR", "NAM", "SAM", "SEA", "WAS")[6
 # ********************************************
 
 
-# master tables
+vars <- c("hurs", "rsds", "sfcWind", "tasmax", "tasmin", "pr") %>% set_names()
+
+# master table
+
 str_glue("~/bucket_mine/remo/monthly/{dom}-22") %>% 
   list.dirs(recursive = F) %>% 
+  .[str_detect(., str_flatten(vars, "|"))] %>% 
   map_dfr(function(d){
     
     pos_model <- 3
+    pos_rmodel <- 6
     pos_date <- 9
     
-    
     tibble(file = d %>%
-             list.files()) %>%
+             list.files() %>% 
+             .[str_detect(., "regrid")] %>%
+             .[str_detect(., "cut", negate = T)]) %>%
       mutate(
         
         var = file %>%
@@ -44,6 +55,12 @@ str_glue("~/bucket_mine/remo/monthly/{dom}-22") %>%
         model = file %>%
           str_split("_", simplify = T) %>%
           .[ , pos_model],
+        
+        rmodel = file %>%
+          str_split("_", simplify = T) %>%
+          .[ , pos_rmodel] %>% 
+          str_split("-", simplify = T) %>% 
+          .[ , 2],
         
         t_i = file %>%
           str_split("_", simplify = T) %>%
@@ -58,211 +75,215 @@ str_glue("~/bucket_mine/remo/monthly/{dom}-22") %>%
           str_c("01")
         
       )
-  }) -> tb_files
+  }) %>% 
+  mutate(model = str_glue("{rmodel}_{model}")) %>% 
+  select(-rmodel) -> tb_files
+
 
 # create chunks index table
 source("scripts/tiling.R")
 
+# orography
+"~/bucket_mine/remo/fixed/" %>%
+  list.files(full.names = T) %>%
+  .[str_detect(., dom)] %>%
+  .[str_detect(., "regrid")] %>% 
+  .[str_detect(., "Had")] %>% 
+  read_ncdf() %>%
+  suppressMessages() %>%
+  mutate(orog = set_units(orog, NULL)) %>%
+  setNames("v") %>% 
+  mutate(v = ifelse(v < 0, 0, v)) -> s_z
+
+# TOA radiation from ERA
+
+"~/bucket_mine/era/monthly/era5_monthly_mean_daily_radiation_shifted.nc" %>% 
+  read_ncdf(var = "tisr", ncsub = cbind(start = c(1,1,1),
+                                        count = c(NA, NA, 1))) -> s_e_proxy
+
+which.min(abs(st_get_dimension_values(s_e_proxy, "longitude") - (st_bbox(s_proxy)[1]-1))) -> era_st_lon
+which.min(abs(st_get_dimension_values(s_e_proxy, "longitude") - (st_bbox(s_proxy)[3]+1))) - era_st_lon -> era_ct_lon
+which.min(abs(st_get_dimension_values(s_e_proxy, "latitude") - (st_bbox(s_proxy)[4]+1))) -> era_st_lat
+which.min(abs(st_get_dimension_values(s_e_proxy, "latitude") - (st_bbox(s_proxy)[2]-1))) - era_st_lat -> era_ct_lat
+  
+# tic()
+"~/bucket_mine/era/monthly/era5_monthly_mean_daily_radiation_shifted.nc" %>% 
+  read_ncdf(var = "tisr", ncsub = cbind(start = c(era_st_lon, era_st_lat, 1),
+                                        count = c(era_ct_lon, era_ct_lat, NA))) %>%
+  suppressMessages() -> tisr_era
+# toc()
+
+st_dimensions(tisr_era)$longitude$offset <- st_get_dimension_values(s_e_proxy, "longitude")[era_st_lon]
+st_dimensions(tisr_era)$latitude$offset <- st_get_dimension_values(s_e_proxy, "latitude")[era_st_lat]
+
+tisr_era %>% 
+  st_warp(s_proxy) %>%
+  # st_warp(s_z) %>% 
+  mutate(tisr = tisr %>% 
+           set_units(MJ/m^2) %>% 
+           set_units(NULL)) -> tisr_era
+
+tisr_era %>% 
+  st_apply(c(1,2), function(t){
+    
+    matrix(t, ncol = 12, byrow = T) %>% 
+      apply(2, mean)
+    
+  },
+  FUTURE = T,
+  .fname = "month") %>% 
+  aperm(c(2,3,1)) -> tisr_era_monthly_mean
+
+rm(era_st_lon, era_st_lat, era_ct_lat, era_ct_lon)
+rm(s_proxy, s_e_proxy, tisr_era)
+
+
+
 
 # MODEL LOOP
-for(mod in c("Had", "MPI", "Nor")){                                                                  # ****************************
+
+walk(unique(tb_files$model)[-1], function(mod){                                                     # **********************************
+  
+  # mod <- unique(tb_files$model)[2]
   
   print(str_glue("PROCESSING MODEL {mod} ----------"))
   print(str_glue(" "))
   
-  dir_chunks_dom <- str_glue("~/pers_disk/{dom}_{mod}")
-  dir.create(dir_chunks_dom)
   
-  # case_when(mod == "Had" ~ 2014,
-  #           mod == "MPI" ~ 2006,
-  #           mod == "Nor" ~ 2019) -> mid_yr
+  # MOVE NCs
   
-  # orography
-  "~/bucket_mine/remo/fixed/" %>%
-    list.files(full.names = T) %>%
-    .[str_detect(., dom)] %>%
-    .[str_detect(., "regrid")] %>% 
-    .[str_detect(., "Had")] %>% 
-    read_ncdf() %>%
-    suppressMessages() %>%
-    mutate(orog = set_units(orog, NULL)) %>%
-    setNames("v") -> s_z
+  print(str_glue("   MOVING NC FILES"))
   
-  # str_glue("~/bucket_risk/RCM_regridded_data/REMO2015/{dom}/daily/model_attributes/") %>%
-  #   list.files(full.names = T) %>%
-  #   .[str_detect(., "orog")] %>%
-  #   .[str_detect(., mod)] %>%
-  #   .[1] %>% 
-  #   read_ncdf() %>%
-  #   suppressMessages() %>%
-  #   mutate(orog = set_units(orog, NULL)) %>%
-  #   setNames("v") -> s_z
-  # 
-  # st_set_dimensions(s_z, "lon", values = round(st_get_dimension_values(s_z, "lon"), 1)) -> s_z
-  # st_set_dimensions(s_z, "lat", values = round(st_get_dimension_values(s_z, "lat"), 1)) -> s_z
-  # st_set_crs(s_z, 4326) -> s_z
+  dir_model_files <- str_glue("~/pers_disk/{mod}_wholefiles") # *****
+  dir.create(dir_model_files)
   
-  # TOA radiation from ERA
-  "~/bucket_mine/era/monthly/era5_monthly_mean_daily_radiation_shifted.nc" %>% 
-    read_ncdf(var = "tisr") %>% 
-    suppressMessages() %>%
-    st_warp(s_z) %>% 
-    mutate(tisr = tisr %>% 
-             set_units(MJ/m^2) %>% 
-             set_units(NULL)) -> tisr_era
-  
-  tisr_era %>% 
-    st_apply(c(1,2), function(t){
-      
-      tibble(m = rep(1:12, 42),
-             t = t) %>% 
-        group_by(m) %>% 
-        summarize(t = mean(t)) %>% 
-        pull(t)
-      
-    },
-    FUTURE = T,
-    .fname = "month") %>% 
-    aperm(c(2,3,1)) -> tisr_era_monthly_mean
+  future_pwalk(tb_files %>% filter(model == mod), function(file, 
+                                                           var, 
+                                                           dom_ = dom, 
+                                                           dir_ = dir_model_files,
+                                                           ...){
+    
+    orig <- file %>%
+      {str_glue("gs://clim_data_reg_useast1/remo/monthly/{dom_}-22/{var}/{.}")}
+    
+    dest <- file %>%
+      {str_glue("{dir_}/{.}")}
+    
+    system(str_glue("gsutil cp {orig} {dest}"),
+           ignore.stdout = TRUE, ignore.stderr = TRUE)
+    
+  })
   
   
-  # CHUNKS LOOP
-  tb_files %>% 
-    filter(str_detect(model, mod)) %>% 
-    mutate(rr = row_number()) -> tb_files_sub
+  # TILE LOOP
   
-  pwalk(chunks_ind[16:35,], function(lon_ch, lat_ch, r, ...){                                         ##################
+  dir_tiles <- str_glue("~/pers_disk/{mod}_tiles") # *****
+  dir.create(dir_tiles)
+  
+  pwalk(st_drop_geometry(chunks_ind), function(lon_ch, lat_ch, r){                                  # *****************************
     
     # r <- chunks_ind$r[1]
     # lon_ch <- chunks_ind$lon_ch[1]
     # lat_ch <- chunks_ind$lat_ch[1]
     
-    print(str_glue("  PROCESSING CHUNK {r} / {nrow(chunks_ind)}"))
+    print(str_glue("   PROCESSING TILE {r} / {nrow(chunks_ind)}"))
     
-    # clip
-    tic(str_glue("   Done clipping"))
-    pwalk(tb_files_sub, function(file, var, rr, ...){
-
-      infile <- str_glue("~/bucket_mine/remo/monthly/{dom}-22/{var}/{file}")
-
-      outfile <- file %>%
-        str_sub(end = -4) %>%
-        {str_glue("~/bucket_mine/remo/monthly/{dom}-22/{var}/{.}_cut.nc")}
+    
+    # CROP FILES ----
+    
+    print(str_glue("      Cropping tile"))
+    
+    dir_tile_tmp <- str_glue("~/pers_disk/{mod}_tile_{r}") # *****
+    dir.create(dir_tile_tmp)
+    
+    future_walk(list.files(dir_model_files, full.names = T), function(f,
+                                                                      lon_chunks_ = lon_chunks,
+                                                                      lat_chunks_ = lat_chunks,
+                                                                      lon_ch_ = lon_ch,
+                                                                      lat_ch_ = lat_ch,
+                                                                      dir_tile_tmp_ = dir_tile_tmp){
       
-      # tic(str_glue("{rr} / {nrow(tb_files_sub)}"))
+      outfile <- f %>%
+        str_split("/", simplify = T) %>% 
+        .[, ncol(.)] %>% 
+        str_sub(end = -4) %>%
+        {str_glue("{dir_tile_tmp_}/{.}_cut.nc")}
+      
       system(
         str_glue(
           "cdo 
           selindexbox,
-          {lon_chunks[[lon_ch]][1]},
-          {lon_chunks[[lon_ch]][2]},
-          {lat_chunks[[lat_ch]][1]},
-          {lat_chunks[[lat_ch]][2]} 
-          {infile} 
+          {lon_chunks_[[lon_ch_]][1]},
+          {lon_chunks_[[lon_ch_]][2]},
+          {lat_chunks_[[lat_ch_]][1]},
+          {lat_chunks_[[lat_ch_]][2]} 
+          {f} 
           {outfile}"
         ) %>% 
           str_flatten() %>% 
           str_replace_all("\n", ""),
         ignore.stderr = T
       )
-      # toc()
-
-    })
-    toc()
-
-
-    # move
-    dir_chunks_tmp <- str_glue("~/pers_disk/{dom}_{mod}_{r}")
-    dir.create(dir_chunks_tmp)
-
-    tic(str_glue("   Done moving/deleting"))
-    pwalk(tb_files_sub, function(file, var, rr, ...){
-
-      orig <- file %>%
-        str_sub(end = -4) %>%
-        {str_glue("gs://clim_data_reg_useast1/remo/monthly/{dom}-22/{var}/{.}_cut.nc")}
-
-      dest <- file %>%
-        str_sub(end = -4) %>%
-        {str_glue("{dir_chunks_tmp}/{.}_cut.nc")}
-
-      # tic(str_glue("{rr} / {nrow(tb_files_sub)}"))
-
-      system(str_glue("gsutil -m cp {orig} {dest}"),
-             ignore.stdout = TRUE, ignore.stderr = TRUE)
-
-      # delete files
-      # access denied:
-      # system(str_glue("gsutil rm {orig}"),
-      #        ignore.stdout = TRUE, ignore.stderr = TRUE)
-
-      # alternative
-      file %>%
-        str_sub(end = -4) %>%
-        {str_glue("~/bucket_mine/remo/monthly/{dom}-22/{var}/{.}_cut.nc")} %>%
-        file.remove() %>%
-        invisible()
-
-      # toc()
-
-    })
-    toc()
-    
-    
-    # load vars
-    tic(str_glue("   Done loading/deriving vars"))
-    
-    vars <- c("hurs", "rsds", "sfcWind", "tas", "pr") %>% set_names()
-    map(vars, function(var){
       
-      # print(var)
+    })
+    
+    
+    # LOAD INTO STARS ----
+    
+    print(str_glue("      Importing/pre-processing vars"))
+    
+    map(vars, function(var_){
       
-      dir_chunks_tmp %>% 
-        list.files(full.names = T) %>% 
-        .[str_detect(., var)] %>%
-        map(read_ncdf) %>%  
-        suppressMessages() %>% 
-        map(~st_set_dimensions(.x, "time",
-                               values = st_get_dimension_values(.x, "time") %>% 
-                                 as.character() %>% 
-                                 as_date())) %>%
+      # print(str_glue("         {var_}"))
+      
+      tb_files %>% 
+        filter(model == mod,
+               var == var_) %>% 
+        
+        future_pmap(function(file, t_i, t_f, dir_ = dir_tile_tmp, r_ = r, ...){
+          
+          seq(as_date(t_i), as_date(t_f), by = "1 month") -> d
+          
+          file %>% 
+            str_sub(end = -4) %>%
+            {str_glue("{.}_cut.nc")} %>% 
+            {str_glue("{dir_}/{.}")} %>% 
+            read_ncdf() %>% 
+            suppressMessages() %>%
+            st_set_dimensions("time", values = d)
+          
+        },
+        .options = furrr_options(seed = NULL)) %>% 
         do.call(c, .) %>% 
         setNames("v") -> s
       
-      if(var == "tas"){
+      s %>% 
+        st_get_dimension_values("time") %>% 
+        duplicated() %>% 
+        which() -> dup
+      
+      if(length(dup) > 0){
+        s %>% 
+          slice("time", -dup) -> s
+        
+        st_get_dimension_values(s, "time") %>% 
+          {seq(first(.), last(.), by = "1 month")} %>% 
+          {st_set_dimensions(s, "time", .)} -> s
+      }
+      
+      if(str_detect(var_, "tas")){
         
         s %>% 
           mutate(v = set_units(v, degC) %>% 
                    set_units(NULL)) -> s
         
-      } else if(var == "pr"){
+      } else if(var_ == "pr"){
         
-        if(mod == "Had"){
-          
-          s %>% 
-            mutate(v = set_units(v, kg/m^2/d) %>%
-                     set_units(NULL) %>% 
-                     {.*30}) -> s
-          
-        } else {
-          
-          s %>% 
-            st_get_dimension_values("time") %>%
-            days_in_month() %>% 
-            unname() -> days_mth
-          
-          s %>% 
-            mutate(v = set_units(v, kg/m^2/d) %>%
-                     set_units(NULL)) %>% 
-            st_apply(c(1,2),
-                     function(x) x * days_mth,
-                     .fname = "time") %>%
-            st_set_dimensions("time", values = st_get_dimension_values(s, "time")) %>%
-            aperm(c(2,3,1)) -> s
-          
-        }
+        s %>% 
+          mutate(v = set_units(v, kg/m^2/d) %>%
+                   set_units(NULL)) -> s
         
-      } else if(var == "rsds"){
+      } else if(var_ == "rsds"){
         
         s %>% 
           mutate(v = set_units(v, MJ/d/m^2) %>% 
@@ -275,143 +296,35 @@ for(mod in c("Had", "MPI", "Nor")){                                             
       
       return(s)
       
-    }) -> s_vars
-    
-    s_vars[[1]] %>% 
-      st_get_dimension_values("time") -> dates
-    
-    # derive additional vars
-    c(s_vars$hurs,
-      s_vars$tas) %>% 
-      setNames(c("hurs", "tas")) %>% 
-      mutate(dewp = 243.04*(log(hurs/100)+((17.625*tas)/(243.04+tas)))/
-               (17.625-log(hurs/100)-((17.625*tas)/(243.04+tas)))) %>% 
-      select(dewp) %>% 
-      setNames("v") -> s_vars[["dewp"]]
-    
-    # s_z %>% 
-    #   filter(lon >= st_get_dimension_values(s_vars[[1]], "lon", where = "start")[1],
-    #          lon <= st_get_dimension_values(s_vars[[1]], "lon", where = "end") %>% last(),
-    #          lat >= st_get_dimension_values(s_vars[[1]], "lat", where = "start")[1],
-    #          lat <= st_get_dimension_values(s_vars[[1]], "lat", where = "end") %>% last()) -> s_vars[["orog"]]
+    }) -> l_s_vars
     
     s_z %>%
-      st_crop(s_vars[[1]]) %>%
-      suppressMessages() -> s_vars[["orog"]]
+      st_crop(l_s_vars[[1]]) %>%
+      suppressMessages() -> l_s_vars[["orog"]]
     
-    s_vars[["orog"]] %>% 
+    l_s_vars[["orog"]] %>% 
       st_dim_to_attr() %>% 
       select(2) %>% 
-      setNames("v") -> s_vars[["lat"]]
-    
-    # if(dim(s_vars[["orog"]])[2] != dim(s_vars[[1]])[2]){
-    #   s_vars[1:6] %>% 
-    #     map(st_crop, s_vars[["orog"]]) %>% 
-    #     suppressMessages() -> s_vars[1:6]
-    # }
-    
-    # tisr_era_monthly_mean %>% 
-    #   filter(lon >= st_get_dimension_values(s_vars[[1]], "lon", where = "start")[1],
-    #          lon <= st_get_dimension_values(s_vars[[1]], "lon", where = "end") %>% last(),
-    #          lat >= st_get_dimension_values(s_vars[[1]], "lat", where = "start")[1],
-    #          lat <= st_get_dimension_values(s_vars[[1]], "lat", where = "end") %>% last()) -> s_vars[["tisr"]]
+      setNames("v") -> l_s_vars[["lat"]]
     
     tisr_era_monthly_mean %>%
-      st_crop(s_vars[[1]]) %>%
-      suppressMessages() -> s_vars[["tisr"]]
-    
-    toc()
+      st_crop(l_s_vars[[1]]) %>%
+      suppressMessages() -> l_s_vars[["tisr"]]
     
     
-    # *************
     
-    # calculate pet (penman)
-    tic(str_glue("   Done calculating PET PM"))
+    # CALCULATE PET (Penman-M) ----
     
-    s_vars[c("tas", 
-            "rsds", 
-            "tisr",
-            "sfcWind", 
-            "dewp", 
-            "orog"#, 
-            #"lat"
-            )] %>% 
-      map(pull, 1) -> s_vars_pet
-      
-    s_vars_pet %>% 
-      {do.call(abind, c(., along = 3))} -> s_array
+    print(str_glue("      Calculating PET - Penman"))
     
-    names(dim(s_array)) <- c("lon", "lat", "time")
-    
-    s_array %>% 
-      st_as_stars() -> s_array
-    
-    s_vars_pet %>% 
-      map_int(~dim(.x)[3]) %>% 
-      map_int(~ifelse(is.na(.x), 1L, .x)) %>% 
-      unname() %>% 
-      {c(1, .)} %>% 
-      cumsum() -> index
-    
-    cbind(index[-length(index)],
-          index[-1]-1) -> index
-    
-    dates %>% 
-      days_in_month() %>% 
-      unname() -> dm
-    
-    case_when(year(dates) < 1980 ~ 331,
-              year(dates) < 1990 ~ 345,
-              year(dates) < 2000 ~ 360,
-              year(dates) < 2010 ~ 379,
-              year(dates) < 2020 ~ 402,
-              year(dates) < 2030 ~ 431,
-              year(dates) < 2040 ~ 468,
-              year(dates) < 2050 ~ 513,
-              year(dates) < 2060 ~ 570,
-              year(dates) < 2070 ~ 639,
-              year(dates) < 2080 ~ 717,
-              year(dates) < 2090 ~ 801,
-              year(dates) >= 2090 ~ 890) -> cp
-    
-    s_array %>% 
-      st_apply(c(1,2), function(x, days_mth, co2_ppm){
-        
-        penman_mine(Tmean = x[index[1,1]:index[1,2]],
-                    Rs = x[index[2,1]:index[2,2]],
-                    Ra = x[index[3,1]:index[3,2]],
-                    u2 = x[index[4,1]:index[4,2]],
-                    Tdew = x[index[5,1]:index[5,2]],
-                    z = x[index[6,1]:index[6,2]],
-                    #lat = x[index[7,1]:index[7,2]],
-                    co2adj = T,
-                    model_i = mod,
-                    days_mth = days_mth,
-                    co2_ppm = co2_ppm)
-        
-      },
-      days_mth = dm,
-      co2_ppm = cp,
-      .fname = "time",
-      FUTURE = T) %>%
-      
-      aperm(c(2,3,1)) %>% 
-      setNames("pet") -> s_pet_pm
-    
-    st_dimensions(s_pet_pm) <- st_dimensions(s_vars$pr)
-    
-    saveRDS(s_pet_pm, str_glue("{dir_chunks_dom}/s_pet_pmco2_{dom}_{mod}_{r}.rds"))
-    
-    toc()
-    
-    
-    # *************
-    
-    # calculate pet with thornwaite
-    tic(str_glue("   Done calculating PET Th"))
-    
-    s_vars[c("tas", 
-             "lat"
+    l_s_vars[c("tasmax",
+               "tasmin",
+               "rsds", 
+               "tisr",
+               "sfcWind", 
+               "hurs", 
+               "orog"#, 
+               #"lat"
     )] %>% 
       map(pull, 1) -> s_vars_pet
     
@@ -433,15 +346,91 @@ for(mod in c("Had", "MPI", "Nor")){                                             
     cbind(index[-length(index)],
           index[-1]-1) -> index
     
+    l_s_vars[[1]] %>% st_get_dimension_values("time") %>% 
+      {case_when(year(.) < 1980 ~ 331,
+                 year(.) < 1990 ~ 345,
+                 year(.) < 2000 ~ 360,
+                 year(.) < 2010 ~ 379,
+                 year(.) < 2020 ~ 402,
+                 year(.) < 2030 ~ 431,
+                 year(.) < 2040 ~ 468,
+                 year(.) < 2050 ~ 513,
+                 year(.) < 2060 ~ 570,
+                 year(.) < 2070 ~ 639,
+                 year(.) < 2080 ~ 717,
+                 year(.) < 2090 ~ 801,
+                 year(.) >= 2090 ~ 890)} -> cp
+    
+    first_month <- st_get_dimension_values(l_s_vars[[1]], "time") %>% first() %>% month()
+    
     s_array %>% 
+      st_apply(c(1,2), function(x, co22, f_m){
+        
+        penman_mine_remo(Tmax = x[index[1,1]:index[1,2]],
+                         Tmin = x[index[2,1]:index[2,2]],
+                         Rs = x[index[3,1]:index[3,2]],
+                         Ra = x[index[4,1]:index[4,2]],
+                         u2 = x[index[5,1]:index[5,2]],
+                         RH = x[index[6,1]:index[6,2]],
+                         z = x[index[7,1]:index[7,2]],
+                         co2_ppm = co22,
+                         first_month = f_m)
+        
+      },
+      co22 = cp,
+      f_m = first_month,
+      .fname = "time",
+      FUTURE = T) %>%
+      
+      aperm(c(2,3,1)) %>% 
+      setNames("pet") -> s_pet_pm
+    
+    st_dimensions(s_pet_pm) <- st_dimensions(l_s_vars$pr)
+    
+    saveRDS(s_pet_pm, str_glue("{dir_tiles}/s_pet_pmco2_{r}.rds"))
+    
+    
+    
+    
+    # CALCULATE PET (Th) ----
+    
+    print(str_glue("      Calculating PET - Thornwaite"))
+    
+    l_s_vars[c("tasmax",
+             "tasmin",
+             "lat"
+    )] %>%
+      map(pull, 1) -> s_vars_pet
+    
+    s_vars_pet %>%
+      {do.call(abind, c(., along = 3))} -> s_array
+    
+    names(dim(s_array)) <- c("lon", "lat", "time")
+    
+    s_array %>%
+      st_as_stars() -> s_array
+    
+    s_vars_pet %>%
+      map_int(~dim(.x)[3]) %>%
+      map_int(~ifelse(is.na(.x), 1L, .x)) %>%
+      unname() %>%
+      {c(1, .)} %>%
+      cumsum() -> index
+    
+    cbind(index[-length(index)],
+          index[-1]-1) -> index
+    
+    s_array %>%
       st_apply(c(1,2), function(x){
         
         if(anyNA(x)){
-          rep(NA, length(dates))
+          rep(NA, index[1,2])
         } else {
           
-          SPEI::thornthwaite(Tave = x[index[1,1]:index[1,2]],
-                             lat = x[index[2,1]:index[2,2]])
+          tas <- (x[index[1,1]:index[1,2]] + x[index[1,1]:index[1,2]]) / 2
+          
+          SPEI::thornthwaite(Tave = tas,
+                             lat = x[index[3,1]:index[3,2]])
           
         }
         
@@ -449,199 +438,179 @@ for(mod in c("Had", "MPI", "Nor")){                                             
       .fname = "time",
       FUTURE = T) %>%
       
-      aperm(c(2,3,1)) %>% 
+      aperm(c(2,3,1)) %>%
       setNames("pet") -> s_pet_th
     
-    st_dimensions(s_pet_th) <- st_dimensions(s_vars$pr)
+    st_dimensions(s_pet_th) <- st_dimensions(l_s_vars$pr)
     
-    saveRDS(s_pet_th, str_glue("{dir_chunks_dom}/s_pet_th_{dom}_{mod}_{r}.rds"))
-    
-    toc()
+    saveRDS(s_pet_th, str_glue("{dir_tiles}/s_pet_th_{r}.rds"))
     
     
-    # *************
+    
+    # CALCULATE SPEIs ----
     
     # calculate spei
-    tic(str_glue("   Done calculating 7 SPEIs"))
+    print(str_glue("      Calculating many SPEIs"))
     
-    dates %>%
+    l_s_vars[[1]] %>% 
+      st_get_dimension_values("time") %>% 
       first() %>% 
       year() -> first_yr
     
     c(s_pet_pm,
-      s_vars$pr) %>% 
+      l_s_vars$pr) %>% 
       mutate(bal = v-pet) %>% 
       select(bal) -> s_bal
     
-    walk(c(1,3,6,9,12,24,36), function(sc){
+    walk(c(1,2,3,6,9,12,18,24,36), function(sc){
+      
+      # print(str_glue("         sc = {sc}"))
       
       s_bal %>% 
         st_apply(c(1,2), function(x){
           
           if(anyNA(x)){
-            rep(NA, length(dates))
+            rep(NA, length(x))
           } else {
             
-            sc_1 <- sc - 1
+            # sc_1 <- sc - 1
             
             x %>% 
               ts(start = first_yr,
                  frequency = 12) -> x_ts
             
-            SPEI::spei(x_ts,
-                       scale = sc,
-                       # ref.start = c(mid_yr-10, 1),
-                       # ref.end = c(mid_yr+10, 12)
-                       ref.start = c(1971, 1),
-                       ref.end = c(2000, 12)
+            spei(x_ts,
+                 scale = sc,
+                 ref.start = c(1971, 1),
+                 ref.end = c(2000, 12)
             ) %>% 
               .$fitted %>% 
               as.vector() %>% 
               {ifelse(is.infinite(.), NA, .)} -> x_spei
             
-            if(sc_1 == 0){
-              
-              x_spei %>% 
-                imputeTS::na_interpolation("spline", maxgap = 5)
-              
-            } else {
-              
-              x_spei %>% 
-                .[-(1:sc_1)] %>% 
-                imputeTS::na_interpolation("spline", maxgap = 5) %>% 
-                {c(rep(NA, sc_1), .)}
-              
-            }
+            return(x_spei)
           }
         },
         .fname = "time",
         FUTURE = T) %>% 
         
         setNames("spei") %>% 
-        st_set_dimensions("time", values = dates) %>% 
+        st_set_dimensions("time", 
+                          values = st_get_dimension_values(l_s_vars$pr, "time")) %>% 
         aperm(c(2,3,1)) -> s_spei
       
       str_pad(sc, 2, "left", "0") -> scc
-      saveRDS(s_spei, str_glue("{dir_chunks_dom}/s_spei-{scc}_{dom}_{mod}_{r}.rds"))
+      saveRDS(s_spei, str_glue("{dir_tiles}/s_spei-{scc}_{r}.rds"))
       
     })
     
-    toc()
     
     
-    # *************
+    # CALCULATE PDSI ----
+    print(str_glue("      Calculating PDSI"))
     
-    # calculate pdsi
-    tic(str_glue("   Done calculating 2 PDSIs"))
-    
-    dates %>%
+    l_s_vars[[1]] %>% 
+      st_get_dimension_values("time") %>% 
       last() %>%
       year() -> last_yr
     
     which(seq(first_yr, last_yr) == 1971) -> cal_start_i
     which(seq(first_yr, last_yr) == 2000) -> cal_end_i
     
-    c(s_vars$pr, s_pet_pm, along = 3) -> s_pr_pet 
+    c(l_s_vars$pr, s_pet_pm, along = 3) -> s_pr_pet
     dim(s_pr_pet)[3]/2 -> index
     
-    
-    walk(c(0, 6), function(mw){
-      
-      s_pr_pet %>% 
-        st_apply(c(1,2), function(x){
-          
-          if(anyNA(x)){
-            rep(NA, index)
-          } else {
-            
-            x[1:index] %>% 
-              ts(start = first_yr,
-                 frequency = 12) -> x_P
-            
-            x[(index+1):(index*2)] %>% 
-              ts(start = first_yr,
-                 frequency = 12) -> x_PE
-            
-            scPDSI::pdsi(P = x_P, 
-                         PE = x_PE, 
-                         sc = T,
-                         cal_start = cal_start_i,
-                         cal_end = cal_end_i
-            )$X %>% as.vector() -> ts_pdsi
-            
-            if(mw != 0){
-              zoo::rollmean(ts_pdsi,
-                            k = mw,
-                            align = "right",
-                            fill = NA)
-            } else {
-              ts_pdsi
-            }
-            
-          }
-          
-        },
-        .fname = "time",
-        FUTURE = T,
-        future.seed = NULL) %>%
+    s_pr_pet %>%
+      st_apply(c(1,2), function(x){
         
-        aperm(c(2,3,1)) %>% 
-        setNames("pdsi") %>% 
-        st_set_dimensions("time", values = dates) -> s_pdsi
+        if(anyNA(x)){
+          rep(NA, index)
+        } else {
+          
+          x[1:index] %>%
+            ts(start = first_yr,
+               frequency = 12) -> x_P
+          
+          x[(index+1):(index*2)] %>%
+            ts(start = first_yr,
+               frequency = 12) -> x_PE
+          
+          scPDSI::pdsi(P = x_P,
+                       PE = x_PE,
+                       sc = T,
+                       cal_start = cal_start_i,
+                       cal_end = cal_end_i
+          ) -> pdsi
+          
+          pdsi$X %>% as.vector() %>% na.omit()
+          
+        }
+        
+      },
+      .fname = "time",
+      FUTURE = T,
+      future.seed = NULL) %>% 
       
-      str_pad(mw, 2, "left", "0") -> mww
-      saveRDS(s_pdsi, str_glue("{dir_chunks_dom}/s_pdsi-{mww}_{dom}_{mod}_{r}.rds"))
-      
-    })
+      aperm(c(2,3,1)) %>%
+      setNames("pdsi") %>%
+      st_set_dimensions("time", 
+                        st_get_dimension_values(l_s_vars$pr, "time")) -> s_pdsi
     
-    toc()
+    saveRDS(s_pdsi, str_glue("{dir_tiles}/s_pdsi-01_{r}.rds"))
     
-    unlink(dir_chunks_tmp, recursive = T)
+    
+    
+    # ****** 
+    
+    unlink(dir_tile_tmp, recursive = T)
     
     print(str_glue(" "))
     
-  })
+  }) #end of tile loop
+    
+    
+    
   
+  # MOSAIC AND SAVE ----
   
-  
-  
-
-  c("pet_pmco2", "pet_th", 
-    "spei-01", "spei-03", "spei-06", "spei-09", "spei-12", "spei-24", "spei-36",
-    "pdsi-00", "pdsi-06") %>%                                                                       # ********************
-    .[-1] %>% 
+  c("pet_pmco2", "pet_th",
+    "spei-01", "spei-02", "spei-03", "spei-06", "spei-09", 
+    "spei-12", "spei-18", "spei-24", "spei-36",
+    "pdsi-01") %>%
+    
     walk(function(fvar){
       
-      # mosaick
       print(str_glue("  MOSAICKING ({fvar})"))
       
-      list.files(dir_chunks_dom, full.names = T) %>%
+      list.files(dir_tiles, full.names = T) %>%
         .[str_detect(., fvar)] %>% 
-        map(readRDS) -> chunks
+        map(readRDS) -> all_tiles
       
-      seq_len(dim(chunks[[1]])[3]) %>% 
+      seq_len(dim(all_tiles[[1]])[3]) %>%
         split(ceiling(./60)) %>%
         imap(function(t,i){
-          
+
           if(as.numeric(i) %% 5 == 0){
-            print(str_glue("      {i} mosaicked"))
+            print(str_glue("      {as.numeric(i)*60} / {dim(all_tiles[[1]])[3]} mosaicked"))
           }
-          # print(i)
-          
-          chunks %>% 
-            map(slice, "time", t) -> chunks_sub 
-          
-          chunks_sub %>%   
-            map(as, "SpatRaster") %>% 
-            do.call(terra::merge, .) %>% 
-            st_as_stars() %>% 
-            st_set_dimensions(3, 
+
+          all_tiles %>%
+            map(slice, "time", t) -> all_tiles_sub
+
+          all_tiles_sub %>%
+            map(as, "SpatRaster") %>%
+            do.call(terra::merge, .) %>%
+            st_as_stars() %>%
+            st_set_dimensions(3,
                               name = "time",
-                              values = st_get_dimension_values(chunks_sub[[1]], "time"))
-          
+                              values = st_get_dimension_values(all_tiles_sub[[1]], "time"))
+
         }) -> s_mos
       
       do.call(c, c(s_mos, along = "time")) -> s_mos
+      
+      s_mos %>% 
+        mutate(values = ifelse(is.infinite(values), NA, values)) -> s_mos
       
       fvar %>% 
         str_replace("_", "-") -> fvar
@@ -654,336 +623,38 @@ for(mod in c("Had", "MPI", "Nor")){                                             
       # save
       print(str_glue("  SAVING ({fvar})"))
       
-      st_get_dimension_values(chunks[[1]], "time") %>% first() %>% as.character() %>% year() -> first_yr
-      st_get_dimension_values(chunks[[1]], "time") %>% last() %>% as.character() %>% year() -> last_yr
+      st_get_dimension_values(all_tiles[[1]], "time") %>% first() %>% as.character() %>% year() -> first_yr
+      st_get_dimension_values(all_tiles[[1]], "time") %>% last() %>% as.character() %>% year() -> last_yr
       
-      rm(chunks)
-      
+      rm(all_tiles)
       
       if(str_detect(fvar, "spei|pdsi")){
-        outfile <- str_glue("~/bucket_mine/results/global_spei_ww/{dom}_{mod}_monthly_{fvar}_{first_yr}_{last_yr}_cal0p5.nc")
+        outfile <- str_glue("output/{dom}_{mod}_monthly_{fvar}_{first_yr}_{last_yr}_cal0p5.nc")
       } else {
-        outfile <- str_glue("~/bucket_mine/results/global_spei_ww/{dom}_{mod}_monthly_{fvar}_{first_yr}_{last_yr}.nc")
+        outfile <- str_glue("output/{dom}_{mod}_monthly_{fvar}_{first_yr}_{last_yr}.nc")
+      }
+      
+      if(file.exists(outfile)){
+        file.remove(outfile) %>% 
+          invisible()
       }
       
       func_write_nc(s_mos, outfile)
       
-    })
+      system(str_glue("gsutil cp {outfile} gs://clim_data_reg_useast1/results/global_spei_ww"))
+      
+      file.remove(outfile) %>% 
+        invisible()
+      
+      rm(s_mos)
+    
+    }) # end of mosaic loop
   
-  unlink(dir_chunks_dom, recursive = T)
+  unlink(dir_tiles, recursive = T)
+  unlink(dir_model_files, recursive = T)
   
   print(str_glue(" "))
   print(str_glue(" "))
   
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# MODEL LOOP
-for(mod in c("Had", "MPI", "Nor")){
-  
-  print(str_glue("[{dom}] [{mod}] STARTED"))
-  tic(str_glue("      Done with model {mod} of domain {dom}")) # 1
-  
-  # number of years
-  if(mod == "Had"){
-    yrs <- 130
-  } else {
-    yrs <- 131
-  }
-  
-  
-  # DOWNLOAD FILES ******
-  
-  print(str_glue(" "))
-  print(str_glue("[{dom}] [{mod}] Downloading files"))
-  tic(str_glue("   Done downloading")) # 3
-  
-  dir_down <- str_glue("~/pers_disk/{dom}") # create download directory
-  dir.create(dir_down)
-  source("scripts/02_download.R")
-  
-  toc() # 3
-  
-  
-  # CREATE DATES VECTOR *****
-  
-  if(mod == "Had"){
-    as.PCICt("1970-01-01", cal = "360") + (seq(0, yrs*360-1) * (60*60*24)) -> dates
-  } else {
-    seq(as_date("19700101"), as_date("21001231"), by = "1 day") %>% 
-      as_datetime() %>% as.PCICt(cal = "gregorian") -> dates
-  }
-  
-  
-  # CREATE TILES INDICES *****
-  
-  source("scripts/03_tiling.R")
-  
-  
-  # CALCULATE INDICES *****
-  
-  case_when(mod == "Had" ~ 2014,
-            mod == "MPI" ~ 2006,
-            mod == "Nor" ~ 2019) -> mid_yr
-  
-  # loop across chunks
-  dir_tmp_chunks <- "~/pers_disk/tmp_chunks"
-  dir.create(dir_tmp_chunks)
-  
-  pwalk(chunks_ind, function(lon_ch, lat_ch, r, ...){
-    
-    print(str_glue(" "))
-    print(str_glue("[{dom}] [{mod}] Processing chunk {r} / {nrow(chunks_ind)}"))
-    tic(str_glue("      Done processing chunk")) # 4
-    
-    # import all variables
-    
-    dir_tmp_vars <- "~/pers_disk/tmp_vars"
-    dir.create(dir_tmp_vars)
-    
-    walk(c("tasmax", "tasmin", "pr"), function(v){
-      
-      # dir_down %>% 
-      #   list.files(full.names = T) %>% 
-      #   .[str_detect(., v)] -> files_vector
-      
-      tb_files %>%
-        map_dfr(~.x) %>%
-        filter(str_detect(file, v)) %>%
-        filter(str_detect(file, mod)) %>% 
-        arrange(t_i) %>% 
-        pull(file) %>% 
-        {str_c(dir_down,"/", .)} -> files_vector
-      
-      imap(files_vector, function(f, i){
-        
-        tic(str_glue("   Imported {v} - {i} / {length(files_vector)}")) # 5
-        
-        read_ncdf(f, ncsub = cbind(start = c(lon_chunks[[lon_ch]][1],
-                                             lat_chunks[[lat_ch]][1],
-                                             1),
-                                   count = c(lon_chunks[[lon_ch]][2] - lon_chunks[[lon_ch]][1] +1,
-                                             lat_chunks[[lat_ch]][2] - lat_chunks[[lat_ch]][1] +1,
-                                             NA))) %>%
-          suppressMessages() -> s_imp
-        
-        toc() # 5
-        
-        return(s_imp)
-        
-      }) -> s
-      
-      s %>%
-        do.call(c, .) %>%
-        setNames("var") -> s
-      
-      if(str_detect(v, "tas")){
-        s %>%
-          mutate(var = var %>% set_units(degC)) -> s
-      } else {
-        s %>%
-          mutate(var = var %>% set_units(kg/m^2/d)) -> s
-      }
-      
-      st_set_dimensions(s, "time", values = dates) -> s
-      
-      print(str_glue("      Saving"))
-      tic(str_glue("      Done saving"))
-      saveRDS(s, str_glue("{dir_tmp_vars}/tmp_star_{v}.rds"))
-      toc()
-      
-    })
-    
-    # stack three variables along time
-    list.files(dir_tmp_vars, full.names = T) %>%
-      {c(.[str_detect(., "tasmax")], .[str_detect(., "tasmin")], .[str_detect(., "pr")])} %>% 
-      map(readRDS) -> s
-    
-    unlink(dir_tmp_vars, recursive = T)
-    
-    s %>% 
-      map(mutate, var = var %>% set_units(NULL)) %>% 
-      {do.call(c, c(., along = 3))} -> s_stack
-    
-    # add lat to determine northern hemisphere
-    s[[1]] %>%
-      filter(time == as_date("1970-01-01")) %>%
-      st_dim_to_attr() %>%
-      dplyr::select("lat") %>% 
-      {c(s_stack, ., along = 3)} -> s_stack
-    
-    
-    # *****
-    
-    # calculate ETCCDI indices
-    
-    print(str_glue(" "))
-    print(str_glue("   Calculating etccdi"))
-    tic(str_glue("   Done with etccdi")) # 6.1
-    
-    cbind(seq(1, length(dates)*3, length(dates)),
-          seq(1, length(dates)*3, length(dates)) + length(dates)-1) -> ind
-    
-    func_ecctdi(s_stack, ind, dates) -> s_etccdi
-    
-    # save ETCCDI indices
-    
-    print(str_glue("   Saving etccdi"))
-    
-    walk2(seq(1, yrs*27, yrs), 
-          c("fd", "su", "id", "tr",
-            "gsl",
-            "txx", "tnx", "txn", "tnn",
-            "tn10p", "tx10p", "tn90p", "tx90p",
-            "wsdi", "csdi", "dtr",
-            "rx1day", "rx5day",
-            "sdii", "r10mm", "r20mm", "rnnmm",
-            "cdd", "cwd",
-            "r95ptot", "r99ptot", "prcptot"),
-          
-          function(t, i){
-            
-            s_etccdi %>% 
-              slice(time, t:(t+yrs-1)) %>% 
-              st_set_dimensions("time", values = dates %>% .[month(.) == 1 & day(.) == 1]) %>% 
-              setNames(i) %>% 
-              
-              saveRDS(str_glue("{dir_tmp_chunks}/star_{i}_{lon_ch}_{lat_ch}.rds"))
-            
-          })
-    
-    toc() # 6.1
-    
-    
-    # *****
-    
-    # calculate biovars
-    
-    print(str_glue("   Calculating biovars"))
-    tic(str_glue("   Done with biovars")) # 6.2
-    
-    func_biovars(s_stack, ind, dates) -> s_biovar
-    
-    # save biovars
-    
-    print(str_glue("   Saving biovars"))
-    
-    walk2(seq(1, yrs*19, yrs), 
-          str_glue("biovar{seq(1,19) %>% str_pad(2, 'left', '0')}"),
-          
-          function(t, i){
-            
-            s_biovar %>% 
-              slice(time, t:(t+yrs-1)) %>% 
-              st_set_dimensions("time", values = dates %>% .[month(.) == 1 & day(.) == 1]) %>% 
-              setNames(i) %>% 
-              
-              saveRDS(str_glue("{dir_tmp_chunks}/star_{i}_{lon_ch}_{lat_ch}.rds"))
-            
-          })
-    
-    toc() # 6.2
-    
-    print(str_glue(" "))
-    
-    toc() # 4
-    
-    print(str_glue(" "))
-    
-  }) # end of chunk loop
-  
-  
-  # MOSAICK *****
-  
-  print(str_glue(" "))
-  print(str_glue("[{dom}] [{mod}] Mosaicking"))
-  tic(str_glue("   Done mosaicking")) # 7
-  
-  if(mod == "Had") last_yr <- 2099 else last_yr <- 2100
-  
-  # loop across variables
-  c("fd", "su", "id", "tr",
-    "gsl",
-    "txx", "tnx", "txn", "tnn",
-    "tn10p", "tx10p", "tn90p", "tx90p",
-    "wsdi", "csdi", "dtr",
-    "rx1day", "rx5day",
-    "sdii", "r10mm", "r20mm", "rnnmm",
-    "cdd", "cwd",
-    "r95ptot", "r99ptot", "prcptot",
-    str_glue("biovar{seq(1,19) %>% str_pad(2, 'left', '0')}")) %>% 
-    
-    walk(function(v){
-      
-      print(str_glue("Processing variable {v}"))
-      
-      
-      print(str_glue("   Reading chunks"))
-      
-      list.files(dir_tmp_chunks, full.names = T) %>% 
-        .[str_detect(., v)] %>% 
-        map(readRDS) -> chunks
-      
-      print(str_glue("   Mosaicking chunks"))
-      
-      map(chunks, function(s){
-        
-        st_set_dimensions(s, "lon", 
-                          values = st_get_dimension_values(s, "lon") %>% round(1)) -> s
-        
-        st_set_dimensions(s, "lat", 
-                          values = st_get_dimension_values(s, "lat") %>% round(1)) -> s
-        
-        s %>% st_set_crs(4326) -> s
-        
-        s %>% 
-          as("Raster")
-        
-      }) %>% 
-        do.call(merge, .) %>% 
-        st_as_stars() %>% 
-        st_set_dimensions("band", 
-                          values = dates %>% .[month(.) == 1 & day(.) == 1], 
-                          name = "time") %>% 
-        setNames(v) -> var_mosaic
-      
-      print(str_glue("   Saving mosaic"))
-      
-      func_write_nc(var_mosaic,
-                    str_glue("~/bucket_mine/results/global_climchgeindices_ww/{v}_{mod}_{dom}_annual_1970_{last_yr}.nc"))
-      
-    }) # end of loop across variables
-  
-  toc() # 7
-  
-  unlink(dir_tmp_chunks, recursive = T)
-  unlink(dir_down, recursive = T)
-  
-  print(str_glue(" "))
-  toc() # 1
-  
-} # end of model loop
+}) # end of model loop
 
