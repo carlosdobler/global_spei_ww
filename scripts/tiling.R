@@ -1,14 +1,64 @@
+
+c(st_point(c(-180, -90)),
+  st_point(c(180, 90))) %>%
+  st_bbox() %>%
+  st_set_crs(4326) -> box_reference
+
+box_reference %>%
+  st_as_stars(dx = 0.05, dy = 0.05, values = -9999) -> rast_reference_0.05
+
+box_reference %>%
+  st_as_stars(dx = 0.2, dy = 0.2, values = -9999) -> rast_reference_0.2
+
+"~/bucket_mine/misc_data/ne_50m_land/ne_50m_land.shp" %>%
+  st_read(quiet = T) %>%
+  mutate(a = 1) %>%
+  select(a) %>%
+  st_rasterize(rast_reference_0.05) -> land
+
+land %>%
+  st_warp(rast_reference_0.2, use_gdal = T, method = "max") %>%
+  suppressWarnings() %>% 
+  setNames("a") %>%
+  mutate(a = ifelse(a == -9999, NA, 1)) -> land
+
+land %>%
+  st_set_dimensions(c(1,2), names = c("lon", "lat")) -> land
+
+
+if(dom == "AUS"){
+  
+  land %>% 
+    slice(lon, 901:1800) -> land_1
+  
+  st_set_dimensions(land_1, which = "lon", values = st_get_dimension_values(land_1, "lon", center = F)) -> land_1
+  
+  st_set_crs(land_1, 4326) -> land_1
+  
+  land %>% 
+    slice(lon, 1:900) -> land_2
+  
+  st_set_dimensions(land_2, which = "lon", values = st_get_dimension_values(land_2, "lon", center = F)+360) -> land_2
+  
+  st_set_crs(land_2, 4326) -> land_2
+  
+  # st_mosaic(land_1, land_2)
+  
+  list(land_1, land_2) %>% 
+    map(as, "SpatRaster") %>% 
+    do.call(terra::merge, .) %>%
+    st_as_stars() -> land
+  
+  land %>% 
+    setNames("a") -> land
+  
+  rm(land_1, land_2)
+  
+}
+
+
 # size of chunk (pixels in each dim)
 sz <- 50
-
-str_glue("~/bucket_mine/remo/monthly/{dom}-22/") %>% 
-  list.dirs(recursive = F) %>% 
-  .[1] %>% 
-  list.files(full.names = T) %>% 
-  .[str_detect(., "regrid")] %>% 
-  .[str_detect(., "cut", negate = T)] %>%
-  .[str_detect(., "REMO")] %>% 
-  .[1] -> f
 
 f %>% 
   read_ncdf(ncsub = cbind(start = c(1, 1, 1),
@@ -41,42 +91,6 @@ split(d_lat,
   map(~c(first(.x), last(.x))) -> lat_chunks
 
 
-# ******
-
-# imap_dfr(lon_chunks, function(lon_ch, lon_i){
-#   imap_dfr(lat_chunks, function(lat_ch, lat_i){
-#     
-#     # lon_ch <- lon_chunks[[7]]
-#     # lat_ch <- lat_chunks[[6]]
-#     
-#     s_proxy %>% 
-#       slice(lon, lon_ch[1]:lon_ch[2]) %>% 
-#       slice(lat, lat_ch[1]:lat_ch[2]) -> s_proxy_sub
-#     
-#     st_warp(land_rast %>%
-#               st_set_dimensions(which = c(1,2),
-#                                 names = c("lon", "lat")),
-#             s_proxy_sub) -> land_rast_sub
-#     
-#     c(s_proxy_sub, land_rast_sub) %>% 
-#       as_tibble() %>%
-#       rename(var = 3) %>% 
-#       filter(!is.na(var)) %>% # remove empty cells of domain
-#       summarize(prop = sum(!is.na(a))/n()) %>% # how much is land?
-#       pull(prop) -> prop
-#     
-#     tibble(
-#       cover = ifelse(is.na(prop) | prop < 0.005, F, T),
-#       lon_ch = lon_i,
-#       lat_ch = lat_i
-#     )
-#     
-#   })
-# }) %>%
-#   filter(cover == TRUE) %>% 
-#   mutate(r = row_number()) -> chunks_ind
-
-# ******
 
 # table + polygons
 
@@ -86,38 +100,61 @@ imap(lon_chunks, function(lon_ch, lon_i){
     s_proxy %>%
       slice(lon, lon_ch[1]:lon_ch[2]) %>%
       slice(lat, lat_ch[1]:lat_ch[2]) -> s_proxy_sub
-
-    st_warp(land_rast %>%
-              st_set_dimensions(which = c(1,2),
-                                names = c("lon", "lat")),
+    
+    st_warp(land,
             s_proxy_sub) -> land_rast_sub
-
-    land_rast_sub %>%
-      st_as_sf(merge = T) %>%
+    
+    s_proxy_sub %>%
+      st_bbox() %>%
+      st_as_sfc() %>%
+      st_sf() %>%
       mutate(lon_ch = lon_i,
-             lat_ch = lat_i) -> pol
+             lat_ch = lat_i) -> pol_tile
+    
+    pol_tile %>% 
+      mutate(cover = ifelse(all(is.na(pull(land_rast_sub, 1))) | all(is.na(pull(s_proxy_sub, 1))), F, T)) -> pol_tile
+    
+    if(pol_tile$cover == T){
+      land_rast_sub %>%
+        st_as_sf() %>% 
+        summarize() %>%
+        suppressMessages() %>%
+        mutate(lon_ch = lon_i,
+               lat_ch = lat_i) -> pol_land
+    } else {
+      pol_land <- NULL
+    }
+    
+    list(pol_tile, pol_land)
+    
+  })
+  
+}) -> pols
 
-    c(s_proxy_sub, land_rast_sub) %>%
-      as_tibble() %>%
-      rename(var = 3) %>%
-      filter(!is.na(var)) %>% # remove empty cells of domain
-      summarize(prop = sum(!is.na(a))/n()) %>% # how much is land?
-      pull(prop) -> prop
 
-    pol %>%
-      mutate(cover = ifelse(is.na(prop) | prop < 0.005, F, T))
 
-  }) %>%
-    bind_rows()
-
-}) %>%
-  bind_rows() %>%
-  filter(cover == T) %>%
-  group_by(lon_ch, lat_ch) %>%
-  summarize() %>%
-  ungroup() %>%
+map_dfr(pols, function(pols_lon){
+  map_dfr(pols_lon, function(pols_lat){
+    pols_lat %>% 
+      pluck(1)
+  })
+}) %>% 
+  filter(cover == T) %>% 
   mutate(r = row_number()) -> chunks_ind
 
+map_dfr(pols, function(pols_lon){
+  map_dfr(pols_lon, function(pols_lat){
+    pols_lat %>% 
+      pluck(2)
+  })
+}) %>%
+  mutate(r = row_number()) -> chunks_ind_land
 
-rm(f, #s_proxy, 
-   d_lon, n_lon, d_lat, n_lat, sz)
+
+
+rm(f, s_proxy, 
+   d_lon, n_lon, d_lat, n_lat, sz,
+   rast_reference_0.05, rast_reference_0.2, box_reference, land,
+   pols)
+
+
