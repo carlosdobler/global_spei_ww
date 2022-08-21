@@ -105,7 +105,7 @@ imap(lon_chunks, function(lon_ch, lon_i){
       pull(prop) -> prop
 
     pol %>%
-      mutate(cover = ifelse(is.na(prop) | prop < 0.005, F, T))
+      mutate(cover = ifelse(is.na(prop) | prop < 0.0001, F, T))
 
   }) %>%
     bind_rows()

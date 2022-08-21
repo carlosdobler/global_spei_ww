@@ -19,7 +19,7 @@ st_read("~/bucket_mine/misc_data/ne_50m_land/ne_50m_land.shp") %>%
 
 
 # DOMAIN LOOP
-dom <- c("AFR", "AUS", "CAM", "CAS", "EAS", "EUR", "NAM", "SAM", "SEA", "WAS")[7]
+dom <- c("AFR", "AUS", "CAM", "CAS", "EAS", "EUR", "NAM", "SAM", "SEA", "WAS")[2]
 
 
 # ********************************************
@@ -95,54 +95,73 @@ source("scripts/tiling.R")
   setNames("v") %>% 
   mutate(v = ifelse(v < 0, 0, v)) -> s_z
 
+
+
 # TOA radiation from ERA
 
-"~/bucket_mine/era/monthly/era5_monthly_mean_daily_radiation_shifted.nc" %>% 
-  read_ncdf(var = "tisr", ncsub = cbind(start = c(1,1,1),
-                                        count = c(NA, NA, 1))) -> s_e_proxy
+# "~/bucket_mine/era/monthly/era5_monthly_mean_daily_radiation_shifted.nc" %>%
+#   read_ncdf(var = "tisr", proxy = F) -> tisr_era
+# 
+# tisr_era %>%
+#   mutate(tisr = tisr %>% 
+#            set_units(MJ/m^2) %>% 
+#            set_units(NULL)) -> tisr_era
+# 
+# tisr_era %>% 
+#   st_apply(c(1,2), function(t){
+#     
+#     matrix(t, ncol = 12, byrow = T) %>% 
+#       apply(2, mean)
+#     
+#   },
+#   FUTURE = T,
+#   .fname = "month") %>% 
+#   aperm(c(2,3,1)) -> tisr_era_monthly_mean
+# 
+# saveRDS(tisr_era_monthly_mean, "~/bucket_mine/misc_data/tisr_era_monthly_mean.rds")
 
-which.min(abs(st_get_dimension_values(s_e_proxy, "longitude") - (st_bbox(s_proxy)[1]-1))) -> era_st_lon
-which.min(abs(st_get_dimension_values(s_e_proxy, "longitude") - (st_bbox(s_proxy)[3]+1))) - era_st_lon -> era_ct_lon
-which.min(abs(st_get_dimension_values(s_e_proxy, "latitude") - (st_bbox(s_proxy)[4]+1))) -> era_st_lat
-which.min(abs(st_get_dimension_values(s_e_proxy, "latitude") - (st_bbox(s_proxy)[2]-1))) - era_st_lat -> era_ct_lat
+
+readRDS("~/bucket_mine/misc_data/tisr_era_monthly_mean.rds") -> tisr_era_monthly_mean
+
+
+if(dom == "AUS"){
   
-# tic()
-"~/bucket_mine/era/monthly/era5_monthly_mean_daily_radiation_shifted.nc" %>% 
-  read_ncdf(var = "tisr", ncsub = cbind(start = c(era_st_lon, era_st_lat, 1),
-                                        count = c(era_ct_lon, era_ct_lat, NA))) %>%
-  suppressMessages() -> tisr_era
-# toc()
+  tisr_era_monthly_mean %>% 
+    slice(longitude, 721:1440) -> tisr_1
+  
+  st_set_dimensions(tisr_1, which = "longitude", values = st_get_dimension_values(tisr_1, "longitude", center = F)) -> tisr_1
+  
+  st_set_crs(tisr_1, 4326) -> tisr_1
+  
+  tisr_era_monthly_mean %>% 
+    slice(longitude, 1:720) -> tisr_2
+  
+  st_set_dimensions(tisr_2, which = "longitude", values = st_get_dimension_values(tisr_2, "longitude", center = F)+360) -> tisr_2
+  
+  st_set_crs(tisr_2, 4326) -> tisr_2
+  
+  list(tisr_1, tisr_2) %>% 
+    map(as, "SpatRaster") %>% 
+    do.call(terra::merge, .) %>% #plot()
+    st_as_stars(proxy = F) -> tisr
+  
+  tisr %>% 
+    setNames("tisr") -> tisr_era_monthly_mean
+  
+  rm(tisr, tisr_1, tisr_2)
+  
+}
 
-st_dimensions(tisr_era)$longitude$offset <- st_get_dimension_values(s_e_proxy, "longitude")[era_st_lon]
-st_dimensions(tisr_era)$latitude$offset <- st_get_dimension_values(s_e_proxy, "latitude")[era_st_lat]
 
-tisr_era %>% 
-  st_warp(s_proxy) %>%
-  # st_warp(s_z) %>% 
-  mutate(tisr = tisr %>% 
-           set_units(MJ/m^2) %>% 
-           set_units(NULL)) -> tisr_era
-
-tisr_era %>% 
-  st_apply(c(1,2), function(t){
-    
-    matrix(t, ncol = 12, byrow = T) %>% 
-      apply(2, mean)
-    
-  },
-  FUTURE = T,
-  .fname = "month") %>% 
-  aperm(c(2,3,1)) -> tisr_era_monthly_mean
-
-rm(era_st_lon, era_st_lat, era_ct_lat, era_ct_lon)
-rm(s_proxy, s_e_proxy, tisr_era)
+tisr_era_monthly_mean %>% 
+  st_warp(s_z) -> tisr_era_monthly_mean
 
 
 
 
 # MODEL LOOP
 
-walk(unique(tb_files$model)[-1], function(mod){                                                     # **********************************
+walk(unique(tb_files$model), function(mod){                                                         # **********************************
   
   # mod <- unique(tb_files$model)[2]
   
@@ -248,7 +267,7 @@ walk(unique(tb_files$model)[-1], function(mod){                                 
             str_sub(end = -4) %>%
             {str_glue("{.}_cut.nc")} %>% 
             {str_glue("{dir_}/{.}")} %>% 
-            read_ncdf() %>% 
+            read_ncdf(make_time = F) %>% 
             suppressMessages() %>%
             st_set_dimensions("time", values = d)
           
@@ -573,6 +592,8 @@ walk(unique(tb_files$model)[-1], function(mod){                                 
   
   # MOSAIC AND SAVE ----
   
+  plan(multisession, workers = 6)
+  
   c("pet_pmco2", "pet_th",
     "spei-01", "spei-02", "spei-03", "spei-06", "spei-09", 
     "spei-12", "spei-18", "spei-24", "spei-36",
@@ -584,19 +605,96 @@ walk(unique(tb_files$model)[-1], function(mod){                                 
       
       list.files(dir_tiles, full.names = T) %>%
         .[str_detect(., fvar)] %>% 
-        map(readRDS) -> all_tiles
+        future_map(readRDS) -> all_tiles
+      
+      
+      # *********************
+      
+      # print(str_glue("     Slicing..."))
+      # 
+      # dir_slices <- "~/pers_disk/slices"
+      # dir.create(dir_slices)
+      # 
+      # seq_len(dim(all_tiles[[1]])[3]) %>%
+      #   # .[1:100] %>%
+      #   walk(function(i){
+      # 
+      #     dir_i <- str_glue("{dir_slices}/{str_pad(i, 4, 'left', '0')}")
+      #     dir.create(dir_i)
+      # 
+      #     all_tiles %>%
+      #       iwalk(~slice(.x, "time", i) %>%
+      #              saveRDS(str_glue("{dir_i}/m_{.y}.rds")))
+      # 
+      #     # list.files(dir_slices, full.names = T) %>%
+      #     #   future_map(readRDS) %>%
+      # 
+      #   })
+      # 
+      # print(str_glue("     Mosaicking..."))
+      # 
+      # seq_len(dim(all_tiles[[1]])[3]) %>%
+      #   str_pad(4, "left", "0") %>%
+      #   # .[1:100] %>%
+      #   future_map(function(i, dir_slices_ = dir_slices){
+      # 
+      #     str_glue("{dir_slices_}/{i}") %>%
+      #       list.files(full.names = T) %>%
+      #       map(readRDS) %>%
+      #       map(as, "SpatRaster") %>%
+      #       do.call(terra::merge, .) %>%
+      #       st_as_stars()
+      # 
+      #   },
+      #   .options = furrr_options(seed = NULL)
+      #   ) -> s_mos
+      # 
+      # s_mos %>%
+      #   {do.call(c, c(., along = "time"))} %>% 
+      #   st_set_dimensions("time", values = st_get_dimension_values(all_tiles[[1]], "time")) -> s_mos
+      # 
+      # unlink(dir_slices, recursive = T)
+      
+      # *********************
+      
+      # tic()
+      # seq_len(dim(all_tiles[[1]])[3]) %>%
+      #   split(ceiling(./60)) %>%
+      #   # .[1:2] %>%
+      #   imap(function(t,i){
+      # 
+      #     if(as.numeric(i) %% 5 == 0){
+      #       print(str_glue("      {as.numeric(i)*60} / {dim(all_tiles[[1]])[3]} mosaicked"))
+      #     }
+      # 
+      #     all_tiles %>%
+      #       map(slice, "time", t) -> all_tiles_sub
+      # 
+      #     all_tiles_sub %>%
+      #       map(as, "SpatRaster") %>%
+      #       do.call(terra::merge, .) %>%
+      #       st_as_stars() %>%
+      #       st_set_dimensions(3,
+      #                         name = "time",
+      #                         values = st_get_dimension_values(all_tiles_sub[[1]], "time"))
+      # 
+      #   }) -> s_mos
+      # 
+      # do.call(c, c(s_mos, along = "time")) -> s_mos
+      # 
+      # toc()
+      
+      # ******************
+      
       
       seq_len(dim(all_tiles[[1]])[3]) %>%
-        split(ceiling(./60)) %>%
-        imap(function(t,i){
-
-          if(as.numeric(i) %% 5 == 0){
-            print(str_glue("      {as.numeric(i)*60} / {dim(all_tiles[[1]])[3]} mosaicked"))
-          }
-
+        split(ceiling(./5)) %>%
+        # .[1:2] %>%
+        future_map(function(t){
+          
           all_tiles %>%
             map(slice, "time", t) -> all_tiles_sub
-
+          
           all_tiles_sub %>%
             map(as, "SpatRaster") %>%
             do.call(terra::merge, .) %>%
@@ -604,12 +702,16 @@ walk(unique(tb_files$model)[-1], function(mod){                                 
             st_set_dimensions(3,
                               name = "time",
                               values = st_get_dimension_values(all_tiles_sub[[1]], "time"))
-
-        }) -> s_mos
+          
+        },
+        .options = furrr_options(seed = NULL)) -> s_mos
       
       do.call(c, c(s_mos, along = "time")) -> s_mos
       
+      # *****************
+      
       s_mos %>% 
+        setNames("values") %>% 
         mutate(values = ifelse(is.infinite(values), NA, values)) -> s_mos
       
       fvar %>% 
@@ -626,7 +728,6 @@ walk(unique(tb_files$model)[-1], function(mod){                                 
       st_get_dimension_values(all_tiles[[1]], "time") %>% first() %>% as.character() %>% year() -> first_yr
       st_get_dimension_values(all_tiles[[1]], "time") %>% last() %>% as.character() %>% year() -> last_yr
       
-      rm(all_tiles)
       
       if(str_detect(fvar, "spei|pdsi")){
         outfile <- str_glue("output/{dom}_{mod}_monthly_{fvar}_{first_yr}_{last_yr}_cal0p5.nc")
@@ -646,9 +747,13 @@ walk(unique(tb_files$model)[-1], function(mod){                                 
       file.remove(outfile) %>% 
         invisible()
       
+      rm(all_tiles)
       rm(s_mos)
+      gc()
     
     }) # end of mosaic loop
+  
+  plan(multisession)
   
   unlink(dir_tiles, recursive = T)
   unlink(dir_model_files, recursive = T)
