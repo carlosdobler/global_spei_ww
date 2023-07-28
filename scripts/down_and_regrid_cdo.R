@@ -1,24 +1,9 @@
 
 
-str_glue("https://esg-dn1.nsc.liu.se/esg-search/wget?
-         domain={dom}-11&
-         experiment=rcp85&experiment=historical&
-         institute=ICTP&
-         time_frequency=mon&
-
-         variable=hurs&
-         variable=pr&
-         variable=rsds&
-         variable=sfcWind&
-         variable=tasmax&
-         variable=tasmin&
-
-         download_structure=domain,variable") %>%
-
-# str_glue("esgf-data.dkrz.de/esg-search/wget?
-#          domain={dom}-22&
+# str_glue("https://esg-dn1.nsc.liu.se/esg-search/wget?
+#          domain={dom}-11&
 #          experiment=rcp85&experiment=historical&
-#          institute=GERICS&
+#          institute=ICTP&
 #          time_frequency=mon&
 # 
 #          variable=hurs&
@@ -29,6 +14,21 @@ str_glue("https://esg-dn1.nsc.liu.se/esg-search/wget?
 #          variable=tasmin&
 # 
 #          download_structure=domain,variable") %>%
+
+str_glue("esgf-data.dkrz.de/esg-search/wget?
+         domain={dom}-22&
+         experiment=rcp85&experiment=historical&
+         institute=GERICS&
+         time_frequency=mon&
+
+         variable=hurs&
+         variable=pr&
+         variable=rsds&
+         variable=sfcWind&
+         variable=tasmax&
+         variable=tasmin&
+
+         download_structure=domain,variable") %>%
 
   str_flatten() %>% 
   str_replace_all("\n", "") %>% 
@@ -54,7 +54,7 @@ nc <- RNetCDF::open.nc(ff)
 
 # RNetCDF::print.nc(nc)
 
-x <- RNetCDF::var.get.nc(nc, "lon") %>% ifelse(. > 180, .-360, .)
+x <- RNetCDF::var.get.nc(nc, "lon") #%>% ifelse(. > 180, .-360, .)
 y <- RNetCDF::var.get.nc(nc, "lat")
 
 # even values = center of grid cells
@@ -63,6 +63,7 @@ if(as.integer(round((xfirst - trunc(xfirst)) * 10)) %% 2 == 0) xfirst <- xfirst 
 
 xlast <- round(max(x), 1)
 if(as.integer(round((xlast - trunc(xlast)) * 10)) %% 2 == 0) xlast <- xlast - 0.1
+# xlast <- 179.9
 
 yfirst <- round(min(y), 1)
 if(as.integer(round((yfirst - trunc(yfirst)) * 10)) %% 2 == 0) yfirst <- yfirst - 0.1
@@ -87,7 +88,6 @@ str_glue("~/bucket_mine/remo/monthly/{dom}-22/") %>%
 # str_glue("~/bucket_mine/remo/monthly/{dom}-11/") %>%  # ONLY EUR-11!
   list.dirs(recursive = F) %>%
   .[str_detect(., "hurs|pr|rsds|sfcWind|tasmax|tasmin")] %>%
-  .[-(1:3)] %>% 
   
   walk(function(dir_var){
     
@@ -95,7 +95,7 @@ str_glue("~/bucket_mine/remo/monthly/{dom}-22/") %>%
     
     dir_var %>% 
       list.files(full.names = T) %>% 
-      # .[str_detect(., mod_rcm)] %>% 
+      # .[str_detect(., "RegCM4")] %>%                                                                 # **********************
       .[str_detect(., "regrid", negate = T)] %>% 
       
       future_walk(function(f){
@@ -111,19 +111,21 @@ str_glue("~/bucket_mine/remo/monthly/{dom}-22/") %>%
           str_remove(".nc") %>%
           str_c("_regrid.nc") -> f_out
         
-        #tic(f_b)
+        # tic(f_b)
         system(str_glue("cdo remapbil,grid.txt {f} {f_out}"),
-               ignore.stdout = TRUE, ignore.stderr = TRUE)
+               ignore.stdout = TRUE, ignore.stderr = TRUE
+               )
         
         # file.remove(f) %>% 
         #   invisible()
-        #toc()
+        
+        # toc()
         
       })
     
   })
   
-# *****
+ # *****
 # orography:
 
 "~/bucket_mine/remo/fixed/" %>%
